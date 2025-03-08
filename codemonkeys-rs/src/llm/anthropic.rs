@@ -4,6 +4,7 @@ use reqwest::{Client, header};
 use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
+use log::debug;
 
 use crate::config::LLMConfig;
 use crate::llm::client::LLMClient;
@@ -11,8 +12,10 @@ use crate::llm::client::LLMClient;
 /// Anthropic API response for chat completions
 #[derive(Debug, Deserialize)]
 struct AnthropicResponse {
+    #[serde(default)]
     content: Vec<AnthropicContent>,
     #[allow(dead_code)]
+    #[serde(default)]
     usage: Option<AnthropicUsage>,
 }
 
@@ -20,14 +23,17 @@ struct AnthropicResponse {
 struct AnthropicContent {
     #[serde(default)]
     text: String,
+    #[serde(default)]
     r#type: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct AnthropicUsage {
     #[allow(dead_code)]
+    #[serde(default)]
     input_tokens: usize,
     #[allow(dead_code)]
+    #[serde(default)]
     output_tokens: usize,
 }
 
@@ -103,12 +109,15 @@ impl LLMClient for AnthropicClient {
         if !status.is_success() {
             let error_text = response.text().await
                 .context("Failed to read error response from Anthropic API")?;
+            debug!("Anthropic API error: {}", error_text);
             return Err(anyhow::anyhow!("Anthropic API error ({}): {}", status, error_text));
         }
         
-        let response_data: AnthropicResponse = response
-            .json()
-            .await
+        let response_text = response.text().await
+            .context("Failed to read response text from Anthropic API")?;
+        debug!("Anthropic API response: {}", response_text);
+        
+        let response_data: AnthropicResponse = serde_json::from_str(&response_text)
             .context("Failed to parse Anthropic API response")?;
         
         if response_data.content.is_empty() {
@@ -119,7 +128,10 @@ impl LLMClient for AnthropicClient {
         let text_content = response_data.content.iter()
             .find(|content| content.r#type == "text")
             .map(|content| content.text.clone())
-            .ok_or_else(|| anyhow::anyhow!("Anthropic API returned no text content"))?;
+            .unwrap_or_else(|| {
+                debug!("No text content found, using first content item");
+                response_data.content.first().map(|c| c.text.clone()).unwrap_or_default()
+            });
         
         Ok(text_content)
     }

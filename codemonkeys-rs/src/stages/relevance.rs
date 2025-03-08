@@ -15,9 +15,39 @@ use crate::llm::prompts::{RELEVANCE_SYSTEM_PROMPT, get_relevance_user_prompt};
 
 /// Parse the LLM response to extract the relevance decision
 fn parse_response(response: &str) -> RelevanceDecision {
-    // Check for "Not Relevant"
-    let not_relevant_regex = Regex::new(r"RELEVANCE:\s*Not\s+Relevant").unwrap();
-    if not_relevant_regex.is_match(response) {
+    // More flexible patterns that match what the model is actually outputting
+    
+    // Check for "Not Relevant" in various formats
+    let not_relevant_patterns = [
+        r"RELEVANCE:\s*Not\s+Relevant", 
+        r"Relevance\s*(?:of\s*(?:File|the\s*file))?\s*(?:to\s*(?:Issue|the\s*issue))?:\s*Not\s+Relevant",
+        r"Not\s+[Rr]elevant",
+        r"(?:file|relevance)(?:\s+is|\s*:)\s*Not\s+Relevant",
+        r"(?:^|[:\n])\s*The file is not relevant",
+        r"Relevance(?:\s+Decision)?:\s*Not Relevant",
+        r"File relevance:\s*Not relevant",
+        r"Final decision on the relevance(?:\s+of the file)?(?:\s+to the issue)?:\s*Not\s+Relevant"
+    ];
+    
+    // Check response line by line for patterns
+    let response_lower = response.to_lowercase();
+    
+    // First check for not relevant
+    for pattern in not_relevant_patterns {
+        if Regex::new(pattern).unwrap().is_match(response) {
+            return RelevanceDecision {
+                message: response.to_string(),
+                status: RelevanceStatus::NotRelevant,
+                summary: None,
+            };
+        }
+    }
+    
+    // If response contains "not relevant" in various common forms
+    if response_lower.contains("not relevant") || 
+       response_lower.contains("file is not relevant") ||
+       response_lower.contains("is not relevant to the issue") ||
+       (response_lower.contains("relevance") && response_lower.contains("not relevant")) {
         return RelevanceDecision {
             message: response.to_string(),
             status: RelevanceStatus::NotRelevant,
@@ -25,14 +55,79 @@ fn parse_response(response: &str) -> RelevanceDecision {
         };
     }
     
-    // Check for "Relevant" with a summary
-    let relevant_regex = Regex::new(r"RELEVANCE:\s*Relevant\s*\nSUMMARY:(.*?)$").unwrap();
-    if let Some(captures) = relevant_regex.captures(response) {
-        if let Some(summary) = captures.get(1) {
+    // Check for "Relevant" with a summary in various formats
+    let relevant_patterns = [
+        r"RELEVANCE:\s*(?:Yes|Relevant)\s*\nSUMMARY:(.*?)(?:\n|$)",
+        r"Relevance\s*(?:of\s*(?:File|the\s*file))?\s*(?:to\s*(?:Issue|the\s*issue))?:\s*(?:Yes|Relevant)",
+        r"(?:file|relevance)(?:\s+is|\s*:)\s*(?:Yes|Relevant)",
+        r"Relevance (?:Decision|Reasoning):\s*(?:Yes|Relevant|Include)",
+        r"Final Decision on Relevance:\s*(?:Yes|Relevant|Include)",
+        r"File relevance:\s*(?:Yes|Relevant|Include)"
+    ];
+    
+    // First check strict patterns with summary capture
+    for pattern in relevant_patterns {
+        if let Some(captures) = Regex::new(pattern).unwrap().captures(response) {
+            if let Some(summary) = captures.get(1) {
+                return RelevanceDecision {
+                    message: response.to_string(),
+                    status: RelevanceStatus::Relevant,
+                    summary: Some(summary.as_str().trim().to_string()),
+                };
+            }
+        }
+    }
+    
+    // Check if file is marked as relevant
+    if response_lower.contains("yes") && response_lower.contains("relevance") ||
+       response_lower.contains("is relevant") ||
+       response_lower.contains("highly relevant") ||
+       response_lower.contains("partially relevant") ||
+       (response_lower.contains("relevant") && !response_lower.contains("not relevant")) {
+        
+        // Try to find a summary paragraph
+        let mut summary = "Summary not explicitly provided, but file was marked as relevant";
+        
+        // Look for common summary indicators
+        let summary_indicators = [
+            r"Summary:\s*(.*?)(?:\n\n|\n[A-Z]|$)",
+            r"Summary of the File:\s*(.*?)(?:\n\n|\n[A-Z]|$)",
+            r"Important Functions.*?(?:\n\n|\n[A-Z]|$)(.*?)(?:\n\n|\n[A-Z]|$)",
+            r"Functions in the File.*?(?:\n\n|\n[A-Z]|$)(.*?)(?:\n\n|\n[A-Z]|$)"
+        ];
+        
+        for pattern in summary_indicators {
+            if let Some(captures) = Regex::new(pattern).unwrap().captures(response) {
+                if let Some(matched_summary) = captures.get(1) {
+                    summary = matched_summary.as_str().trim();
+                    break;
+                }
+            }
+        }
+        
+        return RelevanceDecision {
+            message: response.to_string(),
+            status: RelevanceStatus::Relevant,
+            summary: Some(summary.to_string()),
+        };
+    }
+    
+    // Additional check for "Output:" header followed by a definitive relevance
+    if let Some(output_start) = response.find("Output:") {
+        let output_part = &response[output_start..];
+        
+        if output_part.contains("Not Relevant") || 
+           output_part.to_lowercase().contains("not relevant") {
+            return RelevanceDecision {
+                message: response.to_string(),
+                status: RelevanceStatus::NotRelevant,
+                summary: None,
+            };
+        } else if output_part.contains("Relevant") && !output_part.contains("Not Relevant") {
             return RelevanceDecision {
                 message: response.to_string(),
                 status: RelevanceStatus::Relevant,
-                summary: Some(summary.as_str().trim().to_string()),
+                summary: Some("Summary extracted from Output section".to_string()),
             };
         }
     }
@@ -46,10 +141,20 @@ fn parse_response(response: &str) -> RelevanceDecision {
 }
 
 /// Check if a file should be included in the relevance assessment
-fn should_include_file(file_path: &str) -> bool {
-    // Only include Python files
-    if !file_path.ends_with(".py") {
-        return false;
+fn should_include_file(file_path: &str, problem: &SWEBenchProblem) -> bool {
+    // Check if the file extension is in the configured include_extensions
+    if !problem.include_extensions.is_empty() {
+        if let Some(extension) = Path::new(file_path).extension() {
+            if let Some(ext_str) = extension.to_str() {
+                if !problem.include_extensions.contains(&ext_str.to_string()) {
+                    return false;
+                }
+            } else {
+                return false; // Can't parse extension
+            }
+        } else {
+            return false; // No extension
+        }
     }
     
     // Exclude test directories as a heuristic
@@ -137,7 +242,7 @@ pub async fn process_codebase(config: RelevanceConfig, codebase_config: &Codebas
     info!("Found {} files in codebase", file_paths.len());
     
     let relevant_files: Vec<_> = file_paths.into_iter()
-        .filter(|path| should_include_file(path))
+        .filter(|path| should_include_file(path, &configured_problem))
         .collect();
     
     info!("Found {} relevant files after filtering: {}", relevant_files.len(), configured_problem.id);

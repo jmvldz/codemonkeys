@@ -29,11 +29,11 @@ pub struct SWEBenchProblem {
     
     /// File extensions to include (not serialized)
     #[serde(skip)]
-    include_extensions: Vec<String>,
+    pub include_extensions: Vec<String>,
     
     /// Directories to exclude (not serialized)
     #[serde(skip)]
-    exclude_dirs: Vec<String>,
+    pub exclude_dirs: Vec<String>,
     
     /// Cached file paths (not serialized)
     #[serde(skip)]
@@ -114,10 +114,16 @@ impl SWEBenchProblem {
             return true;
         }
         
-        // Skip excluded directories
-        if entry.file_type().is_dir() {
-            let dir_name = entry.file_name().to_str().unwrap_or("");
-            return self.exclude_dirs.contains(&dir_name.to_string());
+        // Check if this entry or any of its parent directories are in the exclude list
+        let path = entry.path();
+        for ancestor in path.ancestors() {
+            if let Some(dir_name) = ancestor.file_name() {
+                if let Some(dir_str) = dir_name.to_str() {
+                    if self.exclude_dirs.contains(&dir_str.to_string()) {
+                        return true;
+                    }
+                }
+            }
         }
         
         // Check file extension

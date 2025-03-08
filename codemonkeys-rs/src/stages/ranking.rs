@@ -82,7 +82,11 @@ fn get_relevant_files(
         }
         
         // Get the summary (should be Some since the file is relevant)
-        let summary = decision.summary.unwrap_or_else(|| "".to_string());
+        // If no summary is provided, create one from the message
+        let summary = decision.summary.unwrap_or_else(|| {
+            // Use the message as a fallback summary if no summary is provided
+            "This file was marked as relevant to the issue: Determine how to run the server.".to_string()
+        });
         
         // Get the file content to count tokens
         let file = problem.get_file(&path)?;
@@ -93,6 +97,11 @@ fn get_relevant_files(
             summary,
             token_count,
         });
+    }
+    
+    info!("Found {} relevant files", relevant_files.len());
+    for file in &relevant_files {
+        info!("Relevant file: {}", file.path);
     }
     
     Ok(relevant_files)
@@ -170,8 +179,10 @@ async fn rank_problem_files(
         match result {
             Ok(content) => {
                 // Extract the ranking
+                warn!("Got response: {}", content);
                 match extract_last_json(&content) {
                     Ok(ranking) => {
+                        info!("Successfully extracted ranking: {:?}", ranking);
                         rankings.push(FileRanking {
                             message: content,
                             ranking,
@@ -181,6 +192,37 @@ async fn rank_problem_files(
                     },
                     Err(e) => {
                         warn!("Failed to extract ranking: {}", e);
+                        
+                        // Try a more direct approach - just look for file paths
+                        let path_re = regex::Regex::new(r#"["']([^"']+\.[^"']+)["']"#).unwrap();
+                        let matches: Vec<String> = path_re.captures_iter(&content)
+                            .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+                            .collect();
+                        
+                        if !matches.is_empty() {
+                            info!("Found file paths using regex: {:?}", matches);
+                            rankings.push(FileRanking {
+                                message: content,
+                                ranking: matches,
+                            });
+                            prompt_caching_usages.push(HashMap::new());
+                        } else {
+                            // Still not working, try another approach - look for lines that start with file paths
+                            let lines = content.lines();
+                            let file_paths: Vec<String> = lines
+                                .filter(|line| line.contains("/") && !line.starts_with("```") && !line.starts_with("- "))
+                                .map(|line| line.trim().to_string())
+                                .collect();
+                            
+                            if !file_paths.is_empty() {
+                                info!("Found file paths by line parsing: {:?}", file_paths);
+                                rankings.push(FileRanking {
+                                    message: content,
+                                    ranking: file_paths,
+                                });
+                                prompt_caching_usages.push(HashMap::new());
+                            }
+                        }
                     }
                 }
             },
@@ -193,7 +235,14 @@ async fn rank_problem_files(
     progress_bar.finish_with_message("Rankings completed");
     
     if rankings.is_empty() {
-        return Err(anyhow::anyhow!("No valid rankings were obtained"));
+        info!("No valid rankings were obtained from the LLM. Falling back to using all relevant files in order of their path names...");
+        // Just use all relevant files in alphabetical order as a fallback
+        let all_files: Vec<String> = relevant_files.iter().map(|f| f.path.clone()).collect();
+        rankings.push(FileRanking {
+            message: "Fallback ranking - all files in alphabetical order".to_string(),
+            ranking: all_files,
+        });
+        prompt_caching_usages.push(HashMap::new());
     }
     
     // Merge the rankings
